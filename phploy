@@ -1,6 +1,12 @@
 #! /usr/bin/env php
 <?php
 /**
+ * @todo Document ALL options (some are undocumented)
+ * @todo Include class names in debug output (e.g. `PHPloy_File::get()` rather than just `get()`)
+ * @todo Get SMB working with usernames/etc.
+ * @todo Allow configurable output spam levels
+ */
+/**
  * PHPloy - A PHP Deployment Script
  *
  * @package PHPloy
@@ -15,10 +21,237 @@
 /**
  * Run deployment
  */
-try {
-    $phploy = new PHPloy();
-} catch (Exception $e) {
-     echo $e->getMessage();
+
+define('IS_WINDOWS', (stripos(PHP_OS, 'Win') !== false));
+
+if (IS_WINDOWS) {
+    define('OUTPUT_SMILE', ':)');
+    define('OUTPUT_COFFEE', 'coffee');
+    define('OUTPUT_ARROW_UP', "^");
+    define('OUTPUT_ARROW_RIGHT', "->");
+    define('OUTPUT_CROSS', "X");
+    define('OUTPUT_TICK', '/');
+    define('OUTPUT_ROLLBACK', '@');
+} else {
+    define('OUTPUT_SMILE', '☻');
+    define('OUTPUT_COFFEE', '☕');
+    define('OUTPUT_ARROW_UP', '↑');
+    define('OUTPUT_ARROW_RIGHT', '➝');
+    define('OUTPUT_CROSS', '✗');
+    define('OUTPUT_TICK', '✓');
+    define('OUTPUT_ROLLBACK', '⟲');
+}
+
+interface PHPloy_protocol
+{
+    public function connect(array $serverSpec);
+    public function pwd();
+    public function chdir($dir);
+    public function mkdir($name);
+    public function ls($dir);
+    public function get($remoteFile, $localFile, $binaryTransfer=true);
+    public function put($localFile, $remoteFile, $binaryTransfer=true);
+    public function delete($remoteFile);
+    public function disconnect();
+}
+
+class PHPloy_FTP implements PHPloy_protocol
+{
+    private $connection;
+
+    public function connect(array $serverSpec)
+    {
+        // Make sure the $path ends with a slash.
+        $serverSpec['path'] = rtrim($serverSpec['path'], '/').'/';
+
+        $pathsThatExist = array();
+
+        $connection = @ftp_connect($serverSpec['host'], $serverSpec['port']);
+
+        if ($connection) {
+            if (! ftp_login($connection, $serverSpec['user'], $serverSpec['pass'])) {
+                throw new Exception("Oh Snap: Could not login to {$serverSpec['host']} (Tried to login as {$serverSpec['user']}).\n");
+            }
+
+            ftp_pasv($connection, $serverSpec['passive']);
+
+            if (@ftp_chdir($connection, $serverSpec['path'])) {
+                $this->connection = $connection;
+                PHPloy::output("\r\n+ ---------- ".OUTPUT_SMILE." ---------- +");
+                return true;
+            } else {
+                throw new Exception("Oh Snap: Could not change the FTP directory to {$serverSpec['path']}.\n");
+            }
+        } else {
+            throw new Exception("Oh Snap: Could not connect to {$serverSpec['host']}\n");
+        }
+    }
+
+    public function pwd()
+    {
+        return ftp_pwd($this->connection);
+    }
+
+    public function chdir($dir)
+    {
+        return ftp_chdir($this->connection, $dir);
+    }
+
+    public function mkdir($name)
+    {
+        return ftp_mkdir($this->connection, $name);
+    }
+
+    public function ls($dir)
+    {
+        return ftp_nlist($this->connection, $dir);
+    }
+
+    public function get($remoteFile, $localFile, $binaryTransfer=true)
+    {
+        if (is_resource($localFile)) {
+            return ftp_fget($this->connection, $localFile, $remoteFile, ($binaryTransfer) ? FTP_BINARY : FTP_ASCII);
+        } else {
+            return ftp_get($this->connection, $localFile, $remoteFile, ($binaryTransfer) ? FTP_BINARY : FTP_ASCII);
+        }
+    }
+
+    public function put($localFile, $remoteFile, $binaryTransfer=true)
+    {
+        return ftp_put($this->connection, $remoteFile, $localFile, ($binaryTransfer) ? FTP_BINARY : FTP_ASCII);
+    }
+
+    public function delete($remoteFile)
+    {
+        return ftp_delete($this->connection, $remoteFile);
+    }
+
+    public function disconnect()
+    {
+        return ftp_close($this->connection);
+    }
+}
+
+class PHPloy_File implements PHPloy_protocol
+{
+    private $currentDir = null;
+
+    public function connect(array $serverSpec)
+    {
+        // Make sure the $path ends with a slash.
+        $serverSpec['path'] = rtrim($serverSpec['path'], '/').'/';
+
+        if (is_dir($serverSpec['path']) && scandir($serverSpec['path'])) {
+            $this->currentDir = $serverSpec['path'];
+            PHPloy::output("\r\n+ ---------- ".OUTPUT_SMILE." ---------- +");
+            return true;
+        } else {
+            throw new Exception("Oh Snap: Could not access the local server directory {$serverSpec['path']}.\n");
+        }
+    }
+
+    public function pwd()
+    {
+        PHPloy::output("pwd(): " . realpath($this->currentDir));
+        return realpath($this->currentDir);
+    }
+
+    private function isPathAbsolute($path) {
+        switch (substr($path, 0, 1)) {
+            case '/':
+            case '\\':
+                return true;
+        }
+        if (IS_WINDOWS) {
+            switch (substr($path, 1, 2)) {
+                case ':/':
+                case ':\\':
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private function resolvePath($path) {
+        if (!$this->isPathAbsolute($path)) {
+            $path = $this->currentDir . '/' . $path;
+        }
+
+        $path = PHPloy::normalisePathForGit($path);
+
+        $path = str_replace(array('/./', '//'), '/', $path);
+        return $path;
+    }
+
+    public function chdir($dir)
+    {
+        PHPloy::output("chdir($dir)");
+        $dir = $this->resolvePath($dir);
+
+        if (is_dir($dir) && scandir($dir)) {
+            PHPloy::output("~chdir($dir)");
+            $this->currentDir = $dir;
+            return true;
+        } else {
+            PHPloy::output("!!~chdir($dir)");
+            return false;
+        }
+    }
+
+    public function mkdir($name)
+    {
+        PHPloy::output("mkdir($name)");
+        $name = $this->resolvePath($name);
+        PHPloy::output("~mkdir($name)");
+        return mkdir($name);
+    }
+
+    public function ls($dir)
+    {
+        PHPloy::output("ls($dir)");
+        $dir = $this->resolvePath($dir);
+        PHPloy::output("~ls($dir)");
+        return scandir($dir);
+    }
+
+    public function get($remoteFile, $localFile, $binaryTransfer=true)
+    {
+        PHPloy::output("get($remoteFile, $localFile) [{$this->currentDir}]");
+        $remoteFile = $this->resolvePath($remoteFile);
+        PHPloy::output("~get($remoteFile, $localFile) [{$this->currentDir}]");
+
+        if (is_resource($localFile)) {
+            if ($fp = fopen($remoteFile, 'rb')) {
+                return stream_copy_to_stream($fp, $localFile);
+            } else {
+                trigger_error("Unable to read remote file '$remoteFile'!", E_USER_WARNING);
+                return false;
+            }
+        } else {
+            return copy($remoteFile, $localFile);
+        }
+    }
+
+    public function put($localFile, $remoteFile, $binaryTransfer=true)
+    {
+        PHPloy::output("put($localFile, $remoteFile) [{$this->currentDir}]");
+        $remoteFile = $this->resolvePath($remoteFile);
+        PHPloy::output("~put($localFile, $remoteFile) [{$this->currentDir}]");
+        return copy($localFile, $remoteFile);
+    }
+
+    public function delete($remoteFile)
+    {
+        PHPloy::output("delete($remoteFile)");
+        $remoteFile = $this->resolvePath($remoteFile);
+        PHPloy::output("~delete($remoteFile)");
+        return unlink($remoteFile);
+    }
+
+    public function disconnect()
+    {
+        return true;
+    }
 }
 
 /**
@@ -35,7 +268,7 @@ class PHPloy
     /**
      * @var array $filesToIgnore
      */
-    public $filesToIgnore = array('.gitignore', '.gitmodules');
+    public $filesToIgnore = array('.gitignore', '.gitmodules', '.htaccess', '.htpasswd');
 
     /**
      * @var array $servers
@@ -58,7 +291,7 @@ class PHPloy
     protected $longopts  = array('list', 'rollback::', 'server:', 'sync::');
 
     /**
-     * @var bool|resource $connection
+     * @var PHPloy_FTP $connection
      */
     protected $connection = false;
 
@@ -104,7 +337,7 @@ class PHPloy
     {
         $this->parseOptions();
 
-        if (file_exists("$this->repo/.git")) {
+        if (file_exists("{$this->repo}/.git")) {
             $this->checkSubmodules($this->repo);
             $this->deploy($this->revision);
         } else {
@@ -137,20 +370,33 @@ class PHPloy
             $this->revision = 'HEAD';
         }
 
-        $this->repo = isset($opts['repo']) ? rtrim($opts['repo'], '/') : getcwd();
+        $this->repo = isset($opts['repo']) ? rtrim($opts['repo'], '/\\') : getcwd();
         $this->mainRepo = $this->repo;
+
+        $this->repo = self::normalisePathForGit($this->repo);
+    }
+
+    public static function normalisePathForGit($path) {
+        if (DIRECTORY_SEPARATOR == '\\') {
+            // Need to normalise this because git doesn't like backslashes in paths... =/
+            $path = str_replace(DIRECTORY_SEPARATOR, '/', $path);
+        }
+        return $path;
     }
 
     /**
      * Check for submodules
-     * 
+     *
      * @param string $repo
      */
     protected function checkSubmodules($repo)
     {
-        $command = "git --git-dir=\"$repo/.git\" --work-tree=\"$repo\" submodule status";
+        $command = sprintf("git --git-dir=%s --work-tree=%s submodule status",
+            escapeshellarg("$repo/.git"),
+            escapeshellarg($repo));
         $output = array();
 
+        self::output("#~ $command");
         exec(escapeshellcmd($command), $output);
 
         if (count($output) > 0) {
@@ -165,15 +411,18 @@ class PHPloy
 
     /**
      * Check for sub-submodules
-     * 
+     *
      * @param string $repo
      * @param string $name
      */
     protected function checkSubSubmodules($repo, $name)
     {
-        $command = "git --git-dir=\"$repo/.git\" --work-tree=\"$repo\" submodule foreach git submodule status";
+        $command = sprintf("git --git-dir=%s --work-tree=%s submodule foreach git submodule status",
+            escapeshellarg("$repo/.git"),
+            escapeshellarg($repo));
         $output = array();
 
+        self::output("#~ $command");
         exec(escapeshellcmd($command), $output);
 
         if (count($output) > 0) {
@@ -181,7 +430,7 @@ class PHPloy
                 $line = explode(' ', trim($line));
 
                 if (trim($line[0]) == 'Entering') continue;
-                
+
                 $this->submodules[] = array('revision' => $line[0], 'name' => $name.'/'.$line[1], 'path' => $repo.'/'.$name.'/'.$line[1]);
                 $this->filesToIgnore[] = $line[1];
             }
@@ -190,7 +439,7 @@ class PHPloy
 
     /**
      * Parse Credentials
-     * 
+     *
      * @param string $deploy
      */
     protected function parseCredentials($deploy)
@@ -215,6 +464,7 @@ class PHPloy
     protected function prepareServers()
     {
         $defaults = array(
+            'scheme' => 'ftp',
             'host' => '',
             'user' => '',
             'pass' => '',
@@ -223,7 +473,7 @@ class PHPloy
             'passive' => true,
             'clean_directories' => array()
         );
-        
+
         $servers = $this->parseCredentials('deploy.ini');
 
         foreach ($servers as $name => $options) {
@@ -261,41 +511,44 @@ class PHPloy
             $this->dotRevision = $this->isSubmodule.'/.revision';
         }
 
-        if (@ftp_fget($this->connection, $tmpFile, $this->dotRevision, FTP_ASCII)) {
+        if (@$this->connection->get($this->dotRevision, $tmpFile, false)) {
             fseek($tmpFile, 0);
             $remoteRevision = trim(fread($tmpFile, 1024));
             fclose($tmpFile);
         } else {
-            $this->output('Fresh deployment - grab a ☕');
+            self::output('Fresh deployment - grab a '.OUTPUT_COFFEE);
         }
 
-		$gitCommand = 'git --git-dir="'.$this->repo.'/.git" --work-tree="'.$this->repo.'"';
+        $gitCommand = sprintf("git --git-dir=%s --work-tree=%s",
+            escapeshellarg("{$this->repo}/.git"),
+            escapeshellarg($this->repo));
 
-		if (empty($remoteRevision)) {
-			$command = $gitCommand.' ls-files';
-		} else if ($localRevision == 'HEAD') {
+        if (empty($remoteRevision)) {
+            $command = $gitCommand.' ls-files';
+        } else if ($localRevision == 'HEAD') {
             $command = $gitCommand.' diff --name-status '.$remoteRevision.'...'.$localRevision;
         } else {
             $command = $gitCommand.' diff --name-status '.$remoteRevision.'... '.$localRevision;
         }
 
+        self::output("#~ $command");
         exec(escapeshellcmd($command), $output);
 
-		if (! empty($remoteRevision)) {
-	        foreach ($output as $line) {
-	            if ($line[0] == 'A' or $line[0] == 'C' or $line[0] == 'M') {
-	                // Added (A), Modified (C), Unmerged (M)
-	                $filesToUpload[] = trim(substr($line, 1));
-	            } elseif ($line[0] == 'D') {
-	                // Deleted (D)
-	                $filesToDelete[] = trim(substr($line, 1));
-	            } else {
-	                throw new Exception("Oh Snap: Unknown git-diff status: {$line[0]}");
-	            }
-	        }
+        if (! empty($remoteRevision)) {
+            foreach ($output as $line) {
+                if ($line[0] == 'A' or $line[0] == 'C' or $line[0] == 'M') {
+                    // Added (A), Modified (C), Unmerged (M)
+                    $filesToUpload[] = trim(substr($line, 1));
+                } elseif ($line[0] == 'D') {
+                    // Deleted (D)
+                    $filesToDelete[] = trim(substr($line, 1));
+                } else {
+                    throw new Exception("Oh Snap: Unknown git-diff status: {$line[0]}");
+                }
+            }
         } else {
-		    $filesToUpload = $output;
-		}
+            $filesToUpload = $output;
+        }
 
         $filesToUpload = array_diff($filesToUpload, $this->filesToIgnore);
 
@@ -307,10 +560,10 @@ class PHPloy
 
     /**
      * Deploy files
-     * 
+     *
      * @param string $revision
      */
-    public function deploy($revision = 'HEAD') 
+    public function deploy($revision = 'HEAD')
     {
         $this->prepareServers();
 
@@ -324,14 +577,14 @@ class PHPloy
                 $this->setRevision();
                 continue;
             }
-            
+
             $files = $this->compare($revision);
 
             if ($this->listFiles === true) {
-                $this->output("SERVER ➝ ".$name);
+                self::output("SERVER ".OUTPUT_ARROW_RIGHT." ".$name);
                 $this->listFiles($files);
             } else {
-                $this->output("SERVER ➝ ".$name);
+                self::output("SERVER ".OUTPUT_ARROW_RIGHT." ".$name);
                 $this->push($files);
             }
 
@@ -339,54 +592,54 @@ class PHPloy
                 foreach ($this->submodules as $submodule) {
                     $this->repo = $submodule['path'];
                     $this->isSubmodule = $submodule['name'];
-                    
-                    $this->output("SUBMODULE: ".$this->isSubmodule);
-                    
+
+                    self::output("SUBMODULE: ".$this->isSubmodule);
+
                     $files = $this->compare($revision);
 
                     if ($this->listFiles === true) {
                         $this->listFiles($files);
                     } else {
                         $this->push($files);
-                    } 
+                    }
                 }
             }
 
-            ftp_close($this->connection);
-        }         
+            $this->connection->disconnect();
+        }
     }
 
     /**
      * Check what files will be uploaded/deleted
-     * 
+     *
      * @param array $files
      */
     protected function listFiles($files)
     {
         if (count($files['upload']) > 0 && count($files['delete']) > 0) {
-            $this->output("No files to upload.");
+            self::output("No files to upload.");
         }
 
         if (count($files['upload']) > 0) {
-            $this->output("Files to upload:");
+            self::output("Files to upload:");
 
             foreach ($files['upload'] as $file_to_upload) {
-                $this->output(" ↑ ".$file_to_upload);
+                self::output(" ".OUTPUT_ARROW_UP." ".$file_to_upload);
             }
         }
 
         if (count($files['delete']) > 0) {
-            $this->output("Files to delete:");
+            self::output("Files to delete:");
 
             foreach ($files['delete'] as $file_to_delete) {
-                $this->output(" ✗ ".$file_to_delete);
+                self::output(" ".OUTPUT_CROSS." ".$file_to_delete);
             }
         }
     }
 
     /**
      * Connect to the Server
-     * 
+     *
      * @param string $server
      * @throws Exception if it can't connect to FTP server
      * @throws Exception if it can't login to FTP server
@@ -394,28 +647,29 @@ class PHPloy
      */
     protected function connect($server)
     {
-        // Make sure the $path ends with a slash.
-        $server['path'] = rtrim($server['path'], '/').'/';
-
-        $pathsThatExist = array();
-
-        $connection = @ftp_connect($server['host'], $server['port']);
+        $connection = null;
+        $scheme = strtolower(isset($server['scheme']) ? $server['scheme'] : '');
+        switch ($scheme) {
+            case 'ftp':
+            // An empty scheme defaults to FTP (but non-empty strings do NOT, in order to avoid confusion if someone
+            //  typos 'SMB' and wonders why FTP is suddenly being used...)
+            case '':
+                $connection = new PHPloy_FTP();
+                break;
+            case 'file':
+                $connection = new PHPloy_File();
+                break;
+            case 'smb':
+                $connection = new PHPloy_SMB();
+                break;
+            default:
+                throw new Exception("Unrecognised server scheme `$scheme`.");
+        }
 
         if ($connection) {
-            if (! ftp_login($connection, $server['user'], $server['pass'])) {
-                throw new Exception("Oh Snap: Could not login to {$server['host']} (Tried to login as {$server['user']}).\n");
-            }
-
-            ftp_pasv($connection, $server['passive']);
-
-            if (@ftp_chdir($connection, $server['path'])) {
+            if ($connection->connect($server)) {
                 $this->connection = $connection;
-                $this->output("\r\n+ ---------- ☻ ---------- +");
-            } else {
-                throw new Exception("Oh Snap: Could not change the FTP directory to {$server['path']}.\n");
             }
-        } else {
-            throw new Exception("Oh Snap: Could not connect to {$server['host']}\n");
         }
     }
 
@@ -427,8 +681,12 @@ class PHPloy
         // If revision is not HEAD, the current one, it means this is a rollback.
         // So, we have to revert the files the the state they were in that revision.
         if ($this->revision != 'HEAD') {
-            $this->output("⟲ Rolling back");
-            $command = 'git --git-dir="'.$this->repo.'/.git" --work-tree="'.$this->repo.'" checkout '.$this->revision;
+            self::output(OUTPUT_ROLLBACK." Rolling back");
+            $command = sprintf("git --git-dir=%s --work-tree=%s checkout %s",
+                escapeshellarg("{$this->repo}/.git"),
+                escapeshellarg($this->repo),
+                $this->revision);
+            self::output("#~ $command");
             exec(escapeshellcmd($command));
         }
 
@@ -439,7 +697,7 @@ class PHPloy
         foreach ($filesToUpload as $file) {
             if ($this->isSubmodule) $file = $this->isSubmodule.'/'.$file;
 
-            // Make sure the folder exists in the FTP server.
+            // Make sure the folder exists in the server.
             $dir = explode("/", dirname($file));
             $path = "";
             $ret = true;
@@ -448,115 +706,211 @@ class PHPloy
                 $path .= $dir[$i].'/';
 
                 if (! isset($pathsThatExist[$path])) {
-                    $origin = ftp_pwd($this->connection);
-                    
-                    if (! @ftp_chdir($this->connection, $path)) {
-                        if (! ftp_mkdir($this->connection, $path)) {
+                    $origin = $this->connection->pwd();
+
+                    if (! @$this->connection->chdir($path)) {
+                        if (! $this->connection->mkdir($path)) {
                             $ret = false;
-                            
-                            $this->output("Failed to create '$path'.");
-                            $this->output("Directory could not be created. Please check if a file with the same name exists in the server and delete it.");
-                            
+
+                            self::output("Failed to create '$path'.");
+                            self::output("Directory could not be created. Please check if a file with the same name exists in the server and delete it.");
+
                             return;
                         } else {
-                            $this->output("Created directory '$path'.");
+                            self::output("Created directory '$path'.");
                             $pathsThatExist[$path] = true;
                         }
                     } else {
                         $pathsThatExist[$path] = true;
                     }
-                
-                    @ftp_chdir($this->connection, $origin);
+
+                    @$this->connection->chdir($origin);
                 }
             }
 
             $uploaded = false;
             $attempts = 1;
-            
+
             while (! $uploaded) {
                 if ($attempts == 10) {
                     throw new Exception("Oh Snap: Tried to upload $file 10 times and failed. Something is wrong ...\n");
                 }
 
-                $uploaded = ftp_put($this->connection, $file, $file, FTP_BINARY);
+                $uploaded = $this->connection->put($file, $file, true);
 
                 if (! $uploaded) {
                     $attempts = $attempts + 1;
-                    $this->output("Failed to upload {$file}. Retrying (attempt $attempts/10)... ");
+                    self::output("Failed to upload {$file}. Retrying (attempt $attempts/10)... ");
                 }
             }
-            
-            $this->output("✓ \033[01;37m{$file}\033[0m \033[0;32muploaded\033[0m");
+
+            self::output(OUTPUT_TICK." \033[01;37m{$file}\033[0m \033[0;32muploaded\033[0m");
         }
 
         foreach ($filesToDelete as $file) {
-            ftp_delete($this->connection, $file);
-            $this->output("✓ \033[01;37m{$file}\033[0m \033[01;31mremoved\033[0m");
+            $this->connection->delete($file);
+            self::output(OUTPUT_TICK." \033[01;37m{$file}\033[0m \033[01;31mremoved\033[0m");
         }
 
         if (! empty($server['clean_directories'])) {
             foreach ($server['clean_directories'] as $dir) {
-                if (! $tmpFiles = ftp_nlist($this->connection, $dir)) {
-                    $this->output("{$dir} already empty");
+                if (! $tmpFiles = $this->connection->ls($dir)) {
+                    self::output("{$dir} already empty");
                     continue;
                 }
 
                 foreach ($tmpFiles as $file) {
-                    ftp_delete($this->connection, $file);
+                    $this->connection->delete($file);
                 }
 
-                $this->output("✓ \033[01;37m{$dir}\033[0m \033[01;31memptied\033[0m");
+                self::output(OUTPUT_TICK." \033[01;37m{$dir}\033[0m \033[01;31memptied\033[0m");
             }
         }
 
-        if (count($filesToUpload) > 0 or count($filesToDelete) > 0) {            
+        if (count($filesToUpload) > 0 or count($filesToDelete) > 0) {
             // Set revision on server
-            $this->setRevision();              
+            $this->setRevision();
         } else {
-            $this->output("No files to upload.");
+            self::output("No files to upload.");
         }
 
         // If revision is not HEAD, the current one, it means this is a rollback.
         // So, we have to revert the master because we reverted to an earlier
         // revision before the deploy start.
         if ($this->revision != 'HEAD') {
-            $command = 'git --git-dir="'.$this->repo.'/.git" --work-tree="'.$this->repo.'" checkout master';
+            $command = sprintf("git --git-dir=%s --work-tree=%s checkout master",
+                escapeshellarg("{$this->repo}/.git"),
+                escapeshellarg($this->repo));
+            self::output("#~ $command");
             exec(escapeshellcmd($command));
         }
     }
 
     /**
      * Sets version hash on the server.
-     * 
+     *
      */
     protected function setRevision()
     {
         if ( $this->sync == 'sync' or $this->sync == false ) {
-            $command = "git --git-dir='$this->repo/.git' --work-tree='$this->repo\' rev-parse HEAD";
+            $command = sprintf("git --git-dir=%s --work-tree=%s rev-parse HEAD",
+                escapeshellarg("{$this->repo}/.git"),
+                escapeshellarg($this->repo));
+            self::output("#~ $command");
             exec(escapeshellcmd($command), $locRev);
         } else {
             $locRev = $this->sync;
         }
-        
+
         $temp = tempnam(sys_get_temp_dir(), 'gitRevision');
         file_put_contents($temp, $locRev);
 
-        if (ftp_put($this->connection, $this->dotRevision, $temp, FTP_BINARY)) {         
+        if ($this->connection->put($temp, $this->dotRevision, true)) {
             unlink($temp);
-            if( $this->sync ) $this->output("⟲ revision synced");
-            $this->output("+ ---------- ✓ ---------- +\r\n");
+            if( $this->sync ) self::output("⟲ revision synced");
+            self::output("+ ---------- ".OUTPUT_TICK." ---------- +\r\n");
         } else {
-            throw new Exception("Oh Snap: Could not update the revision file on server.");   
-        }                
+            throw new Exception("Oh Snap: Could not update the revision file on server.");
+        }
     }
 
     /**
      * Helper method to display messages on the screen.
-     * 
+     *
      * @param string $message
      */
-    public function output($message) {
+    public static function output($message) {
+        if (IS_WINDOWS) {
+            // Strip the ANSI colour codes if we're on Windows...
+            // ("✓ \033[01;37m{$dir}\033[0m \033[01;31memptied\033[0m");
+            $message = preg_replace('/
+                \e
+                (
+                    \[[\x20-\x3F]+[\x40-\x7E]
+                    |
+                    [\x40-\x5F]
+                )
+            /x', '', $message);
+        }
+
         echo $message."\r\n";
     }
 
 }
+
+try {
+    $phploy = new PHPloy();
+} catch (Exception $e) {
+     echo $e->getMessage();
+}
+
+/*class PHPloy_SMB implements PHPloy_protocol
+{
+    public function connect(array $serverSpec)
+    {
+        // Make sure the $path ends with a slash.
+        $serverSpec['path'] = rtrim($serverSpec['path'], '/').'/';
+
+        $pathsThatExist = array();
+
+        $connection = @ftp_connect($serverSpec['host'], $serverSpec['port']);
+
+        if ($connection) {
+            if (! ftp_login($connection, $serverSpec['user'], $serverSpec['pass'])) {
+                throw new Exception("Oh Snap: Could not login to {$serverSpec['host']} (Tried to login as {$serverSpec['user']}).\n");
+            }
+
+            ftp_pasv($connection, $serverSpec['passive']);
+
+            if (@ftp_chdir($connection, $serverSpec['path'])) {
+                $this->connection = $connection;
+                PHPloy::output("\r\n+ ---------- ".OUTPUT_SMILE." ---------- +");
+                return true;
+            } else {
+                throw new Exception("Oh Snap: Could not change the FTP directory to {$serverSpec['path']}.\n");
+            }
+        } else {
+            throw new Exception("Oh Snap: Could not connect to {$serverSpec['host']}\n");
+        }
+    }
+
+    public function pwd()
+    {
+        return ftp_pwd($this->connection);
+    }
+
+    public function chdir($dir)
+    {
+        return ftp_chdir($this->connection, $dir);
+    }
+
+    public function mkdir($name)
+    {
+        return ftp_mkdir($this->connection, $name);
+    }
+
+    public function ls($dir)
+    {
+        return ftp_nlist($this->connection, $dir);
+    }
+
+    public function get($remoteFile, $localFile, $binaryTransfer=true)
+    {
+        return ftp_fget($this->connection, $localFile, $remoteFile, ($binaryTransfer) ? FTP_BINARY : FTP_ASCII);
+    }
+
+    public function put($localFile, $remoteFile, $binaryTransfer=true)
+    {
+        return ftp_put($this->connection, $remoteFile, $localFile, ($binaryTransfer) ? FTP_BINARY : FTP_ASCII);
+    }
+
+    public function delete($remoteFile)
+    {
+        return ftp_delete($this->connection, $remoteFile);
+    }
+
+    public function disconnect()
+    {
+        return ftp_close($this->connection);
+    }
+}*/
